@@ -1,0 +1,630 @@
+---
+title: "text Analysis "
+format: html
+editor: visual
+---
+
+## Libraries
+
+```{r}
+#| warning: false
+#| message: false 
+
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(stm)
+library(tm)
+library(ggplot2)
+library(readr)
+library(textdata)
+library(tokenizers)
+library(sentimentr)
+library(tidyr)
+library(topicmodels)
+library(reshape2)
+library(quanteda)
+library(wordcloud)
+```
+
+## Data Cleaning
+
+```{r}
+#| warning: false
+#| message: false 
+
+publications<-read.csv("IS_publications_2011_2020.csv")
+publications_data<- publications %>%
+  select(-c(Volume,Issue,DOI,document_type, pub_stage,open_access,EID, pub_type ,source_name  ))
+#removing irrelevant columns to make the dataset smaller. 
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+
+pub_df <- publications_data %>%
+  mutate(across(c(author_keywords, index_keywords), ~ str_squish(tolower(gsub("[^[:alnum:] ]", "", .))))) %>%
+  mutate(across(c(Authors, author_keywords, index_keywords), ~ str_split(., pattern = ";", simplify = TRUE)))
+#converting to lowercase and removing special characters and extra whitespaces
+
+#removing null Values
+pub_df <- na.omit(pub_df)
+
+#changing to numeric 
+pub_df$cited_by<- as.numeric(pub_df$cited_by)
+pub_df$Year<- as.numeric(pub_df$Year)
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+
+start_year <- 2015
+end_year <- 2020
+df_filtered <- pub_df %>%
+  filter(Year >= start_year & Year <= end_year)
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+remove_stopwords <- function(text) {
+  # Create a Corpus object
+  corpus <- Corpus(VectorSource(text))
+    corpus <- tm_map(corpus, content_transformer(tolower))
+    corpus <- tm_map(corpus, removePunctuation)
+    corpus <- tm_map(corpus, removeWords, stopwords("en"))
+    cleaned_text <- sapply(corpus, as.character)
+  return(cleaned_text)
+}
+# Apply the custom function to the Abstract column
+df_filtered$Abstract_cleaned <- remove_stopwords(df_filtered$Abstract)
+
+```
+
+## Themes in IS between 2015 and 2020, and their relationships
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Create a tidy text data frame
+df_tidy <- df_filtered %>%
+  select(id, Authors,Abstract_cleaned) %>%
+  unnest_tokens(word, Abstract_cleaned)
+
+# calculating tf-idf by first counting the frequency of each word within each id (document) and then calculates the TF-IDF values for each word.
+df_tfidf <- df_tidy %>%
+  count(id, word, name = "n") %>%
+  bind_tf_idf(word, id, n)
+
+# Merge the ID column from publications into df_tidy based on the abstract column
+df_tidy <- df_filtered %>%
+  left_join(publications %>% select(Abstract, DOI), by = c("Abstract_cleaned" = "Abstract"))
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Add a new unique identifier column
+df_tfidf$id_unique <- paste(df_tfidf$id, seq_len(nrow(df_tfidf)), sep = "_")
+
+# Create a corpus from the text
+corp <- corpus(df_tfidf, text_field = "word", docid_field = "id_unique")
+
+# Tokenize the corpus
+toks <- tokens(corp)
+
+dtm <- toks %>%
+  dfm()
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+
+# Convert the tibble to tokens
+toks <- df_tfidf %>%
+  select(id, word) %>%
+  group_by(id) %>%
+  summarize(text = paste(word, collapse = " ")) %>%
+  pull(text) %>%
+  tokens()
+
+# Create a Document-Term Matrix (DTM)
+dtm <- dfm(toks)
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+
+ap_lda <- LDA(dtm, k = 6, control = list(seed = 1234))
+ap_lda
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+
+ap_topics <- tidy(ap_lda, matrix = "beta")
+
+ap_top_terms <- ap_topics |> 
+  group_by(topic) |> 
+  slice_max(beta, n = 12) |> 
+  ungroup() |> 
+  arrange(topic, -beta)
+
+ap_top_terms |> 
+  mutate(term = reorder_within(term, beta, topic)) |> 
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered() + theme_minimal()
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+ap_documents <- tidy(ap_lda, matrix = "gamma")
+
+ap_documents |> 
+  ggplot(aes(gamma, fill = as.factor(topic))) +
+  geom_histogram(alpha = 0.8, show.legend = FALSE, bins = 20) +
+  facet_wrap(~ topic, ncol = 4) +
+  labs(title = "Distribution of probability for each topic",
+       y = "Number of documents", x = expression(gamma))
+
+#identify the topics most associated with a document
+ap_documents_topics <- ap_documents |>  
+  group_by(document) |>  
+  slice_max(gamma, n = 2) %>% #specify 1, 2, 3, n for the number of topics associated with a document
+  ungroup()
+
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+#descriptive statistics for gamma
+ap_documents_topics |>  
+  summarise(mean = mean(gamma),
+            sd = sd(gamma),
+            min = min(gamma),
+            max = max(gamma))
+
+#filter for a higher gamma value
+ap_documents_topics <- ap_documents_topics |>  
+  filter(gamma > 0.4)
+
+ap_documents_topics |>  
+  summarise(mean = mean(gamma),
+            sd = sd(gamma),
+            min = min(gamma),
+            max = max(gamma))
+
+
+#how many documents for each topic?
+ap_documents_topics |>  
+  group_by(topic) |>  
+  tally()
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Create a word cloud
+library(wordcloud)
+wordcloud(words = df_tfidf$word, freq = df_tfidf$n, scale = c(1, 1), max.words = 80, colors = brewer.pal(5, "Dark2"))
+
+
+# Find the top terms for each topic
+top_terms <- ap_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  arrange(topic, desc(beta))
+
+```
+
+## What are the most important keywords in IS research articles each year, and how does the importance of these keywords change over time?
+
+```{r}
+#| warning: false
+#| message: false 
+
+start_year <- 2011
+end_year <- 2020
+df_filtered <- pub_df %>%
+  filter(Year >= start_year & Year <= end_year)
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Create a tidy text data frame
+df_tidy <- df_filtered %>%
+  select(id, Abstract_cleaned, Year) %>%
+  unnest_tokens(word, Abstract_cleaned)
+
+# calculating tf-idf by first counting the frequency of each word within each id (document) and then calculates the TF-IDF values for each word.
+df_tfidf <- df_tidy %>%
+  count(Year, word, name = "n") %>%
+  bind_tf_idf(word, Year, n)
+
+# Group by Year and Calculate TF-IDF
+# Filter out numeric values (e.g., years) from the top keywords
+df_tfidf_by_year <- df_tfidf %>%
+  group_by(Year) %>%
+  mutate(rank = min_rank(-tf_idf)) %>%
+  filter(rank <= 10 & !grepl("^\\d+$", word))  # Filter the top 5 non-numeric keywords for each year
+
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+ggplot(df_tfidf_by_year, aes(x = reorder(word, tf_idf), y = tf_idf, fill = as.factor(Year))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ Year, scales = "free") +
+  labs(title = "Top Keywords in IS Over Time", x = "Keyword", y = "TF-IDF Score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## What are the most common themes in IS research over the decade?
+
+```{r}
+#| warning: false
+#| message: false 
+
+#exploring tf-idf to see which words are important in each topic
+
+# Create a tidy text data frame
+df_tidy <- df_filtered %>%
+  select(id, Authors, Abstract_cleaned) %>%
+  unnest_tokens(word, Abstract_cleaned)
+
+
+# calculating tf-idf by first counting the frequency of each word within each id (document) and then calculates the TF-IDF values for each word.
+df_tfidf <- df_tidy %>%
+  count(id, word, name = "n") %>%
+  bind_tf_idf(word, id, n)
+
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Add a new unique identifier column
+df_tidy$id_unique <- paste(df_tidy$id, seq_len(nrow(df_tidy)), sep = "_")
+
+# Create a corpus from the text
+corp <- corpus(df_tidy, text_field = "word", docid_field = "id_unique")
+
+# Tokenize the corpus
+toks <- tokens(corp)
+
+dtm <- toks %>%
+  dfm()
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Convert the tibble to tokens
+toks <- df_tidy %>%
+  select(Authors, word) %>%
+  group_by(Authors) %>%
+  summarize(text = paste(word, collapse = " ")) %>%
+  pull(text) %>%
+  tokens()
+
+# Create a Document-Term Matrix (DTM)
+dtm <- dfm(toks)
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+#creating a CTM
+data_ctm <-CTM(dtm, 
+               k = 10, 
+               method = "VEM", 
+               control = list(seed = 1234))
+
+```
+
+```{r}
+data_ctm_topics <- tidy(data_ctm, matrix = "beta")
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+data_ctm_topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term,
+             fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic,
+             scales = "free") + #set ncol = 4 if more topics
+  scale_y_reordered() +
+  labs(title = "Top 10 terms in each CTM topic",
+       x = expression(beta), y = NULL) +
+  theme_minimal()
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Define labels for each topic based on the top terms
+topic_labels <- c(
+  "Research and Information Systems",
+  "Digital Innovation and Government",
+  "Consumer Behavior, Online Markets",
+  "Social Media",
+  "Privacy and Information Security",
+  "IS, Theory and Design",
+  "Firms and Customer Service",
+  "Design and Virtual Teams",
+  "Business Performance",
+  "Knowledge Development"
+)
+
+# Create a data frame with the top terms and their corresponding labels
+topic_labels_df <- data.frame(topic = 1:10, label = topic_labels, stringsAsFactors = FALSE)
+
+# Merge the labels with the top terms data
+data_ctm_topics_labeled <- merge(data_ctm_topics, topic_labels_df, by = "topic")
+
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Plot the labeled topics
+data_ctm_topics_labeled %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term,
+             fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ label,
+             scales = "free") +
+  scale_y_reordered() +
+  labs(title = "Assigned Labels for CTM Topics",
+       x = expression(beta), y = NULL) +
+  theme_minimal()
+```
+
+## Sentiment Analysis
+
+```{r}
+tone_data<-pub_df
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Group your data by "Title" and "Year", and collapse the "Abstract" text
+tone_data_grouped <- tone_data %>% 
+  group_by(Title, Year) %>% 
+  summarise_at(vars(-group_cols()), str_c, collapse=" ")
+
+# Perform sentiment analysis on the grouped data
+tone_data_sentiment <- tone_data_grouped %>%  
+  get_sentences(text) %>%  
+  sentiment_by(by = 'Year',
+               polarity_dt = lexicon::hash_sentiment_jockers_rinker,
+               valence_shifters_dt = lexicon::hash_valence_shifters,
+               amplifier.weight = 2,
+               n.before = 3, n.after = 3,
+               question.weight = 0,
+               neutral.nonverb.like = TRUE)
+
+# Rescale the sentiment scores to keep zeros as neutral
+tone_data_sentiment <- tone_data_sentiment %>%   
+  mutate(ave_sentiment = general_rescale(ave_sentiment, 
+                                         lower = -1, 
+                                         upper = 1, 
+                                         keep.zero = TRUE)) 
+
+# Plot the rescaled sentiment scores
+tone_data_sentiment %>% 
+  ggplot(aes(x = ave_sentiment)) +
+  geom_density() +
+  theme_minimal()
+
+```
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Unnest the tokens in the "Abstract" column of your data
+tidy_data <- tone_data %>% 
+  unnest_tokens(word, Abstract)
+
+# Perform sentiment analysis with the Bing lexicon
+tone_data_sentiment <- tidy_data %>% 
+  inner_join(get_sentiments("bing"), by = "word")
+
+# Classify the words as positive, negative, or neutral
+tone_data_sentiment <- tone_data_sentiment %>% 
+  mutate(sentiment = case_when(
+    sentiment == "positive" ~ "Positive",
+    sentiment == "negative" ~ "Negative",
+    TRUE ~ "Neutral"
+  ))
+
+# Count the number of positive, negative, and neutral words
+sentiment_counts <- tone_data_sentiment %>% 
+  count(sentiment)
+
+# Create a bar plot of the sentiment counts
+ggplot(sentiment_counts, aes(x = sentiment, y = n, fill = sentiment)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Sentiment", y = "Count", fill = "Sentiment")
+
+```
+
+## **Most Productive Authors in IS research over the past decade.**
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Split the authors' names by comma, then by space
+author_splits <- str_split(pub_df$Authors, pattern = ",|;")
+
+# Unlist and trim leading/trailing white spaces
+author_splits <- unlist(author_splits) %>% str_trim()
+
+# Create a data frame with authors and their corresponding publications
+author_publications <- tibble(Author = author_splits)
+
+# Count the number of publications per author using dplyr
+author_counts_df <- author_publications %>%
+  group_by(Author) %>%
+  summarise(Count = n())
+
+# Select the top 10 most productive authors
+top_authors <- author_counts_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+#visualising the Authors 
+ggplot(top_authors, aes(x = reorder(Author, Count), y = Count)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  coord_flip() +
+  labs(title = "Top 10 most productive authors", x = "Author", y = "Number of publications") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        panel.grid = element_blank())
+```
+
+## Most productive Journals in the Past Decade
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Calculate the number of publications per journal
+journal_counts_df <- pub_df %>%
+  group_by(source_title) %>%
+  summarise(Count = n()) %>%
+  rename(Journal = source_title)
+
+# Select the top 10 most productive journals
+top_journals <- journal_counts_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+# Truncate long journal names
+top_journals <- top_journals %>%
+  mutate(Journal = ifelse(nchar(Journal) > 20,
+                          paste0(substr(Journal, 1, 20), "..."),
+                          Journal))
+
+# Plot the top 10 most productive journals
+ggplot(top_journals, aes(x = reorder(Journal, Count), y = Count)) +
+  geom_bar(stat = "identity", fill = "green") +
+  coord_flip() +
+  labs(title = "Top 10 most productive journals", x = "Journal", y = "Number of publications") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+## **The most cited Articles in IS**
+
+```{r}
+#| warning: false
+#| message: false 
+
+pub_data<-pub_df
+pub_data<- pub_data %>% 
+  arrange(desc(cited_by))
+
+# Select top N most cited papers
+N <- 10  # Number of top cited papers to include in the analysis
+top_cited_papers <- pub_data %>% 
+  slice_head(n = N)
+
+# Abbreviate titles
+max_title_length <- 30  # Maximum length of the abbreviated title
+top_cited_papers$Abbreviated_Title <- substr(top_cited_papers$Title, 1, max_title_length)
+top_cited_papers$Abbreviated_Title <- ifelse(nchar(top_cited_papers$Title) > max_title_length, paste0(top_cited_papers$Abbreviated_Title, "..."), top_cited_papers$Title)
+
+# Create a scatter plot of the top cited papers
+ggplot(top_cited_papers, aes(x = cited_by, y = reorder(Abbreviated_Title, cited_by), color = Abbreviated_Title, size = Year)) +
+  geom_point() +
+  labs(title = paste("Top", N, "Most Cited Papers"),
+       x = "Citation Counts",
+       y = "Title",
+       color = "Paper Title",
+       size = "Year") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10)) +
+  scale_color_discrete(guide = FALSE)  # To remove the legend
+
+```
+
+## **The growth in the number of publications and citations (Research Growth in IS)**
+
+```{r}
+#| warning: false
+#| message: false 
+
+# Calculate the number of publications and citations for each year
+yearly_data <- pub_df %>%
+  group_by(Year) %>%
+  summarise(Publications = n(),
+            Citations = sum(cited_by, na.rm = TRUE))
+
+# Calculate max values for scaling
+max_publications <- max(yearly_data$Publications, na.rm = TRUE)
+max_citations <- max(yearly_data$Citations, na.rm = TRUE)
+
+# Create a line graph of the number of publications and citations over the years
+ggplot(yearly_data, aes(x = Year)) +
+  geom_line(aes(y = Publications, color = "Publications"), linewidth = 1) +
+  geom_line(aes(y = Citations * max_publications / max_citations, color = "Citations"), linewidth = 1) +
+  scale_color_manual(values = c("Publications" = "blue", "Citations" = "red")) +
+  labs(title = "Number of publications and citations over the years",
+       x = "Year", y = "",
+       color = "Legend") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "bottom") + ylim(0, max_publications) +
+  scale_x_continuous(breaks = seq(min(yearly_data$Year, na.rm = TRUE), max(yearly_data$Year, na.rm = TRUE), by = 1))
+```
